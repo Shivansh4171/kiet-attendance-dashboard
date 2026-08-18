@@ -104,6 +104,52 @@ const enterOtpLikeAUser = async (page: Page, otpValue: string) => {
   return verify;
 };
 
+const AUTH_TOKEN_STORAGE_KEY = "authenticationtoken";
+
+// The dashboard route alone does not reliably fire the per-course
+// attendance request — CyberVidya's Angular app only makes that call from
+// its own Attendance section. Click through like a real user would so the
+// passive request listener above gets a chance to observe the real,
+// current request (method/headers/etc.) rather than nothing at all.
+const triggerAttendanceRequest = async (page: Page) => {
+  const attendanceLink = page.locator("a, button, [role='link'], [role='menuitem']").filter({ hasText: /attendance/i }).first();
+  if (await attendanceLink.count().catch(() => 0)) {
+    await attendanceLink.click({ timeout: 5_000 }).catch(() => undefined);
+    await page.waitForTimeout(1_800);
+  }
+};
+
+// The official portal itself stores its bearer token in localStorage after
+// login and sends it back as `Authorization: GlobalEducation <token>` — this
+// is the current app's own client-side auth mechanism (observable in its
+// bundled JS), not a reconstructed guess. Used only as a fallback for when
+// no live request was actually observed above.
+const readStoredAuthToken = async (page: Page): Promise<string | undefined> => {
+  // This callback runs inside the browser page, not Node — the server
+  // tsconfig has no DOM lib, so `localStorage` is reached via globalThis
+  // with a loose type rather than pulling in DOM types for the whole file.
+  const token = await page
+    .evaluate((key: string) => {
+      try {
+        return (globalThis as { localStorage?: { getItem(k: string): string | null } }).localStorage?.getItem(key) ?? null;
+      } catch {
+        return null;
+      }
+    }, AUTH_TOKEN_STORAGE_KEY)
+    .catch(() => null);
+  if (!token) return undefined;
+  return token.replace(/^"|"$/g, "");
+};
+
+const resolveAttendanceAuthHeaders = async (session: PortalSession): Promise<Record<string, string>> => {
+  // The live browser request is the source of truth when we actually saw
+  // one: it reflects whatever the current portal really requires.
+  if (session.attendanceRequest?.observed && session.attendanceAuthHeaders) return session.attendanceAuthHeaders;
+  const token = await readStoredAuthToken(session.page);
+  if (!token) return {};
+  return { Authorization: `GlobalEducation ${token}` };
+};
+
 const fetchAttendanceApi = async (session: PortalSession, origin: string) => {
   const response = await session.page.request.get(`${origin}${ATTENDANCE_API_PATH}`, {
     headers: session.attendanceAuthHeaders ?? {},
@@ -216,15 +262,17 @@ export class PortalSessionManager {
     await session.page.goto(`${origin}/main/dashboard`, { waitUntil: "domcontentloaded", timeout: 30_000 });
     await session.page.waitForTimeout(1_800);
     await throwIfPortalBlocked(session.page);
+    await triggerAttendanceRequest(session.page);
 
     const dashboardText = await session.page.locator("body").innerText().catch(() => "");
+    session.attendanceAuthHeaders = await resolveAttendanceAuthHeaders(session);
     session.diagnostics = {
       capturedAt: new Date().toISOString(),
       finalUrl: session.page.url(),
       attendanceApi: {
         requestObserved: session.attendanceRequest?.observed ?? false,
         cookieSent: session.attendanceRequest?.cookieSent ?? false,
-        authHeaderNames: session.attendanceRequest?.authHeaderNames ?? [],
+        authHeaderNames: Object.keys(session.attendanceAuthHeaders),
       },
     };
     const payload = await fetchAttendanceApi(session, origin);

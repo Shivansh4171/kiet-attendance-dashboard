@@ -10,10 +10,10 @@ const aliases = {
   name: new Set(["coursename", "coursedescription", "subjectname", "subject", "course", "name"]),
   component: new Set(["component", "componentname", "componenttype", "coursetype", "type"]),
   faculty: new Set(["faculty", "facultyname", "teacher", "teachername", "instructor"]),
-  present: new Set(["present", "presentcount", "presentlecture", "presentlectures", "presentperiods", "classespresent", "classesattended", "attended", "attendedclasses", "attendedlectures"]),
-  total: new Set(["total", "totalcount", "totalclasses", "totallecture", "totallectures", "totalperiods", "classestotal", "classesconducted", "conducted", "conductedclasses"]),
+  present: new Set(["present", "presentcount", "numberofpresent", "presentlecture", "presentlectures", "presentperiods", "classespresent", "classesattended", "attended", "attendedclasses", "attendedlectures"]),
+  total: new Set(["total", "totalcount", "numberofperiods", "totalclasses", "totallecture", "totallectures", "totalperiods", "classestotal", "classesconducted", "conducted", "conductedclasses"]),
   presentTotal: new Set(["presenttotal", "attendancetotal", "lecturecount", "lectures"]),
-  percentage: new Set(["percentage", "attendancepercentage", "attendancepercent", "percent", "attendance"]),
+  percentage: new Set(["percentage", "attendancepercentage", "attendancepercent", "percent", "attendance", "presentpercentage", "presentpercentagewith"]),
   status: new Set(["status", "attendancestatus"]),
   overall: new Set(["overallattendance", "overallattendancepercentage", "overallattendancepercent", "overallpercentage", "totalattendancepercentage"]),
 } as const;
@@ -41,39 +41,39 @@ const countPairFrom = (value: unknown) => {
 
 const isRecord = (value: unknown): value is ApiRecord => Boolean(value) && typeof value === "object" && !Array.isArray(value);
 
-const looksLikeSubject = (record: ApiRecord) => {
-  const code = valueFor(record, aliases.code);
-  const name = valueFor(record, aliases.name);
+type Identity = { code: string; name: string };
+
+// The real CyberVidya payload nests attendance numbers one level below the
+// course identity: a course record carries courseCode/courseName plus a
+// child array of per-component records (componentName/numberOfPresent/
+// numberOfPeriods/presentPercentage), and the child records carry no course
+// identity of their own. So identity has to be read on the way down and
+// carried into whichever descendant actually looks like a component.
+const identityOf = (record: ApiRecord): Identity => ({
+  code: clean(valueFor(record, aliases.code)),
+  name: clean(valueFor(record, aliases.name)),
+});
+
+const hasIdentity = (identity: Identity) => Boolean(identity.code || identity.name);
+
+const looksLikeComponent = (record: ApiRecord) => {
   const component = valueFor(record, aliases.component);
   const attendance = valueFor(record, aliases.percentage);
   const present = valueFor(record, aliases.present);
   const total = valueFor(record, aliases.total);
-  return Boolean((clean(code) || clean(name)) && (clean(component) || attendance !== undefined || present !== undefined || total !== undefined));
+  return Boolean(clean(component) || attendance !== undefined || present !== undefined || total !== undefined);
 };
 
-const collectSubjectRecords = (value: unknown, records: ApiRecord[], seen: Set<ApiRecord>) => {
-  if (Array.isArray(value)) {
-    for (const item of value) collectSubjectRecords(item, records, seen);
-    return;
-  }
-  if (!isRecord(value) || seen.has(value)) return;
-  seen.add(value);
-  if (looksLikeSubject(value)) records.push(value);
-  for (const child of Object.values(value)) collectSubjectRecords(child, records, seen);
-};
-
-const subjectFromRecord = (record: ApiRecord): Subject | null => {
+const subjectFromRecord = (record: ApiRecord, identity: Identity): Subject | null => {
+  if (!hasIdentity(identity)) return null;
   const pair = countPairFrom(valueFor(record, aliases.presentTotal));
   const present = numberFrom(valueFor(record, aliases.present)) ?? pair?.present;
   const total = numberFrom(valueFor(record, aliases.total)) ?? pair?.total;
   const explicitPercentage = percentageFrom(valueFor(record, aliases.percentage));
   const percentage = explicitPercentage ?? (present !== undefined && total ? Math.round((present / total) * 100) : undefined);
-  const courseCode = clean(valueFor(record, aliases.code));
-  const courseName = clean(valueFor(record, aliases.name));
-  if (!courseCode && !courseName) return null;
   return {
-    courseCode,
-    courseName,
+    courseCode: identity.code,
+    courseName: identity.name,
     component: clean(valueFor(record, aliases.component)),
     faculty: clean(valueFor(record, aliases.faculty)),
     present,
@@ -81,6 +81,30 @@ const subjectFromRecord = (record: ApiRecord): Subject | null => {
     percentage: percentage ?? 0,
     ...(clean(valueFor(record, aliases.status)) ? { status: clean(valueFor(record, aliases.status)) } : {}),
   };
+};
+
+const collectSubjects = (value: unknown, subjects: Subject[], seen: Set<ApiRecord>, inherited?: Identity) => {
+  if (Array.isArray(value)) {
+    for (const item of value) collectSubjects(item, subjects, seen, inherited);
+    return;
+  }
+  if (!isRecord(value) || seen.has(value)) return;
+  seen.add(value);
+
+  const own = identityOf(value);
+  const identity = hasIdentity(own) ? own : inherited;
+
+  // A record only becomes a subject once it has BOTH an identity (its own,
+  // or inherited from a parent course record) and component-shaped
+  // attendance numbers. A course record alone (identity, no numbers) or a
+  // component record alone (numbers, no identity) is skipped here and
+  // resolved once the two combine on the way down/up the tree.
+  if (identity && hasIdentity(identity) && looksLikeComponent(value)) {
+    const subject = subjectFromRecord(value, identity);
+    if (subject) subjects.push(subject);
+  }
+
+  for (const child of Object.values(value)) collectSubjects(child, subjects, seen, identity);
 };
 
 const findOverallPercentage = (value: unknown, seen: Set<ApiRecord>): number | undefined => {
@@ -114,9 +138,8 @@ const weightedPercentage = (subjects: Subject[]) => {
 };
 
 export const normalizeAttendanceApiResponse = (payload: unknown, fallbackOverallText = ""): DashboardData => {
-  const records: ApiRecord[] = [];
-  collectSubjectRecords(payload, records, new Set<ApiRecord>());
-  const subjects = records.map(subjectFromRecord).filter((subject): subject is Subject => subject !== null);
+  const subjects: Subject[] = [];
+  collectSubjects(payload, subjects, new Set<ApiRecord>());
   const apiOverall = findOverallPercentage(payload, new Set<ApiRecord>());
   const overallPercentage = apiOverall ?? firstPercentageFromText(fallbackOverallText) ?? weightedPercentage(subjects);
   const present = subjects.reduce((sum, subject) => sum + (subject.present ?? 0), 0);
