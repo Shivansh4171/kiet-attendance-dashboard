@@ -1,10 +1,14 @@
 import crypto from "node:crypto";
-import { chromium, type Locator, type Page } from "playwright";
+import fs from "node:fs/promises";
+import path from "node:path";
+import { chromium, type Locator, type Page, type Response } from "playwright";
 import type { DashboardData } from "../../src/types.js";
 import { normalizeAttendanceApiResponse } from "./normalizer.js";
 import type { PortalDiagnostics, PortalSession } from "./types.js";
 
-const PORTAL_URL = process.env.KIET_PORTAL_URL ?? "https://kiet.cybervidya.net/";
+// Confirmed by manual testing: the current portal serves its login form at
+// the explicit /login path, not the bare origin.
+const PORTAL_URL = process.env.KIET_PORTAL_URL ?? "https://kiet.cybervidya.net/login";
 const ATTENDANCE_API_PATH = "/api/attendance/course/component/student";
 const SESSION_TTL_MS = 30 * 60 * 1000;
 // CyberVidya can take well over 30s to reach "domcontentloaded" (slow
@@ -16,6 +20,7 @@ const PORTAL_NAV_TIMEOUT_MS = 60_000;
 const LOGIN_FORM_TIMEOUT_MS = 60_000;
 const OTP_INPUT_SELECTOR = "#generate-otp app-generate-otp input.otp-input";
 const OTP_VERIFY_SELECTOR = "#generate-otp app-generate-otp button[type='submit']";
+const LOGIN_DEBUG_DIR = process.env.KIET_LOGIN_DEBUG_DIR ?? path.resolve("debug/login");
 
 const sessions = new Map<string, PortalSession>();
 
@@ -46,6 +51,39 @@ const throwIfPortalBlocked = async (page: Page) => {
   const text = (await page.locator("body").innerText().catch(() => "")).toLowerCase();
   if (text.includes("captcha")) throw new Error("The official portal is asking for a CAPTCHA. Complete it on the official portal, then retry.");
   if (text.includes("service unavailable") || text.includes("site cannot be reached")) throw new Error("The KIET portal is currently unavailable.");
+};
+
+// Thrown only when the login form itself never appears. Deliberately a
+// distinct type: the catch block in start() checks for it so it can skip
+// the normal session cleanup and leave the visible browser window open for
+// inspection, instead of closing it like every other startup failure.
+class LoginFormNotFoundError extends Error {
+  constructor(message: string, readonly diagnostics: Record<string, unknown>) {
+    super(message);
+    this.name = "LoginFormNotFoundError";
+  }
+}
+
+// Sanitized only: URL, title, response status, body text length, and
+// presence/counts of known elements. Never page HTML, cookies, or any
+// credential/token value.
+const captureLoginDiagnostics = async (page: Page, response: Response | null) => {
+  const [title, bodyText, usernameCount, passwordCount, iframeCount] = await Promise.all([
+    page.title().catch(() => ""),
+    page.locator("body").innerText().catch(() => ""),
+    page.locator("#username").count().catch(() => 0),
+    page.locator("#password").count().catch(() => 0),
+    page.locator("iframe").count().catch(() => 0),
+  ]);
+  return {
+    url: page.url(),
+    title,
+    responseStatus: response?.status() ?? null,
+    bodyTextLength: bodyText.length,
+    usernameFieldExists: usernameCount > 0,
+    passwordFieldExists: passwordCount > 0,
+    iframeCount,
+  };
 };
 
 const findOtpInputs = async (page: Page) => {
@@ -188,9 +226,28 @@ export class PortalSessionManager {
       // "commit" only waits for navigation to start and the first response
       // to arrive — it does not close the browser just because the rest of
       // the page (scripts, styles, etc.) is still slow to finish loading.
-      await page.goto(PORTAL_URL, { waitUntil: "commit", timeout: PORTAL_NAV_TIMEOUT_MS });
-      // The real success condition: the login form itself becomes usable.
-      await page.locator("#username").waitFor({ state: "visible", timeout: LOGIN_FORM_TIMEOUT_MS });
+      const response = await page.goto(PORTAL_URL, { waitUntil: "commit", timeout: PORTAL_NAV_TIMEOUT_MS });
+      const navigationDiagnostics = await captureLoginDiagnostics(page, response);
+      console.log("[portal] initial navigation diagnostics:", JSON.stringify(navigationDiagnostics));
+
+      const usernameVisible = await page
+        .locator("#username")
+        .waitFor({ state: "visible", timeout: LOGIN_FORM_TIMEOUT_MS })
+        .then(() => true)
+        .catch(() => false);
+
+      if (!usernameVisible) {
+        const failureDiagnostics = await captureLoginDiagnostics(page, response);
+        await fs.mkdir(LOGIN_DEBUG_DIR, { recursive: true }).catch(() => undefined);
+        const screenshotPath = path.join(LOGIN_DEBUG_DIR, `login-form-not-found-${id}.png`);
+        await page.screenshot({ path: screenshotPath, fullPage: true }).catch(() => undefined);
+        console.error("[portal] #username never became visible.", JSON.stringify(failureDiagnostics), `screenshot: ${screenshotPath}`);
+        throw new LoginFormNotFoundError(
+          `The CyberVidya login form (#username) did not appear at ${failureDiagnostics.url}. Diagnostics: ${JSON.stringify(failureDiagnostics)}. Screenshot: ${screenshotPath}`,
+          failureDiagnostics,
+        );
+      }
+
       await page.locator("#password").waitFor({ state: "visible", timeout: LOGIN_FORM_TIMEOUT_MS });
       await page.locator("#username").fill(username);
       await page.locator("#password").fill(password);
@@ -210,7 +267,10 @@ export class PortalSessionManager {
       session.data = await this.collect(session);
       return { id, stage: session.stage, data: session.data };
     } catch (error) {
-      await this.destroy(id);
+      // Debug-only carve-out: when the login form itself never appeared,
+      // leave the visible browser window + session open so it can be
+      // inspected directly instead of closing it like every other failure.
+      if (!(error instanceof LoginFormNotFoundError)) await this.destroy(id);
       throw error instanceof Error ? error : new Error("Could not start the KIET portal session.");
     } finally {
       username = "";
