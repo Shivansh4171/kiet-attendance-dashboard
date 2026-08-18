@@ -7,6 +7,13 @@ import type { PortalDiagnostics, PortalSession } from "./types.js";
 const PORTAL_URL = process.env.KIET_PORTAL_URL ?? "https://kiet.cybervidya.net/";
 const ATTENDANCE_API_PATH = "/api/attendance/course/component/student";
 const SESSION_TTL_MS = 30 * 60 * 1000;
+// CyberVidya can take well over 30s to reach "domcontentloaded" (slow
+// third-party scripts, etc). Waiting on "commit" (navigation started, first
+// response received) and then explicitly waiting for the login form itself
+// is the actual success condition — the page doesn't need to have fully
+// "loaded" for #username/#password to be usable.
+const PORTAL_NAV_TIMEOUT_MS = 60_000;
+const LOGIN_FORM_TIMEOUT_MS = 60_000;
 const OTP_INPUT_SELECTOR = "#generate-otp app-generate-otp input.otp-input";
 const OTP_VERIFY_SELECTOR = "#generate-otp app-generate-otp button[type='submit']";
 
@@ -178,7 +185,13 @@ export class PortalSessionManager {
     sessions.set(id, session);
     captureAttendanceRequest(session, page);
     try {
-      await page.goto(PORTAL_URL, { waitUntil: "domcontentloaded", timeout: 30_000 });
+      // "commit" only waits for navigation to start and the first response
+      // to arrive — it does not close the browser just because the rest of
+      // the page (scripts, styles, etc.) is still slow to finish loading.
+      await page.goto(PORTAL_URL, { waitUntil: "commit", timeout: PORTAL_NAV_TIMEOUT_MS });
+      // The real success condition: the login form itself becomes usable.
+      await page.locator("#username").waitFor({ state: "visible", timeout: LOGIN_FORM_TIMEOUT_MS });
+      await page.locator("#password").waitFor({ state: "visible", timeout: LOGIN_FORM_TIMEOUT_MS });
       await page.locator("#username").fill(username);
       await page.locator("#password").fill(password);
       await page.locator("#submitLogin").click();
